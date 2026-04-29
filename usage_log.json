@@ -1,0 +1,32 @@
+{
+  "sessions": [
+    {
+      "ts": "2026-04-29T13:21:58",
+      "session_id": "test",
+      "model": "claude-sonnet-4-6",
+      "input": 1500,
+      "output": 300,
+      "cache_read": 800,
+      "cache_write": 200,
+      "cost_usd": 0.0085
+    }
+  ],
+  "daily": {
+    "2026-04-29": {
+      "input": 1500,
+      "output": 300,
+      "cache_read": 800,
+      "cache_write": 200,
+      "cost_usd": 0.0085,
+      "turns": 1
+    }
+  },
+  "total": {
+    "input": 1500,
+    "output": 300,
+    "cache_read": 800,
+    "cache_write": 200,
+    "cost_usd": 0.0085,
+    "turns": 1
+  }
+}
