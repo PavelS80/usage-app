@@ -8,13 +8,22 @@ import sys
 import json
 import os
 import glob
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 
-LOG_PATH   = os.path.expanduser("~/.claude/usage_log.json")
-DEBUG_LOG  = os.path.expanduser("~/.claude/usage_debug.log")
-PROJ_DIR   = os.path.expanduser("~/.claude/projects")
+LOG_PATH    = os.path.expanduser("~/.claude/usage_log.json")
+ALERTS_PATH = os.path.expanduser("~/.claude/usage_alerts.json")
+DEBUG_LOG   = os.path.expanduser("~/.claude/usage_debug.log")
+PROJ_DIR    = os.path.expanduser("~/.claude/projects")
 
-# Ceny za 1M tokenů
+# ── Limity (uprav dle svého plánu) ──────────────────────────────────────────
+LIMITS = {
+    "daily_cost_usd":   20.0,    # USD / den
+    "weekly_cost_usd": 100.0,    # USD / týden
+    "session_cost_usd": 10.0,    # USD / session
+}
+THRESHOLDS = [30, 50, 75, 90]   # % pro upozornění
+
+# ── Ceny za 1M tokenů ───────────────────────────────────────────────────────
 PRICES = {
     "claude-sonnet-4-6": {"input": 3.0,  "output": 15.0,  "cache_read": 0.30, "cache_write": 3.75},
     "claude-opus-4-7":   {"input": 15.0, "output": 75.0,  "cache_read": 1.50, "cache_write": 18.75},
@@ -49,11 +58,68 @@ def save_log(data):
     with open(LOG_PATH, "w") as f:
         json.dump(data, f, indent=2)
 
+def load_alerts():
+    if os.path.exists(ALERTS_PATH):
+        try:
+            with open(ALERTS_PATH) as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_alerts(data):
+    with open(ALERTS_PATH, "w") as f:
+        json.dump(data, f, indent=2)
+
+def notify(title, msg):
+    escaped = msg.replace('"', '\\"').replace("'", "\\'")
+    os.system(f'osascript -e \'display notification "{escaped}" with title "{title}" sound name "Ping"\'')
+    debug(f"NOTIFY: {title} — {msg}")
+
+def check_alerts(log, session_id, session_cost):
+    """Zkontroluje překročení prahů a pošle notifikace."""
+    alerts = load_alerts()
+    today  = datetime.now().date().isoformat()
+
+    # Týdenní součet (posledních 7 dní)
+    week_start = (datetime.now().date() - timedelta(days=6)).isoformat()
+    weekly_cost = sum(
+        v["cost_usd"]
+        for day, v in log.get("daily", {}).items()
+        if day >= week_start
+    )
+
+    daily_cost = log.get("daily", {}).get(today, {}).get("cost_usd", 0.0)
+
+    checks = [
+        ("session",  f"session:{session_id}", session_cost,  LIMITS["session_cost_usd"],  "session"),
+        ("daily",    f"daily:{today}",         daily_cost,    LIMITS["daily_cost_usd"],    "den"),
+        ("weekly",   f"weekly:{week_start}",   weekly_cost,   LIMITS["weekly_cost_usd"],   "týden"),
+    ]
+
+    changed = False
+    for kind, key, used, limit, label in checks:
+        if limit <= 0:
+            continue
+        pct = used / limit * 100
+        sent = alerts.get(key, [])
+
+        for thr in THRESHOLDS:
+            if pct >= thr and thr not in sent:
+                notify(
+                    f"Claude Usage — {thr}% {label}",
+                    f"${used:.2f} z ${limit:.0f} ({pct:.0f}%) — {label}"
+                )
+                sent.append(thr)
+                changed = True
+
+        alerts[key] = sent
+
+    if changed:
+        save_alerts(alerts)
+
 def read_transcript(path):
-    """
-    Přečte JSONL transcript, vrátí seznam deduplikovaných assistant zpráv:
-    [{ts, model, input, output, cache_read, cache_write}, ...]
-    """
+    """Přečte JSONL transcript, vrátí seznam deduplikovaných assistant zpráv."""
     if not os.path.exists(path):
         return []
     seen = set()
@@ -85,19 +151,16 @@ def read_transcript(path):
                     continue
                 ts_raw = obj.get("timestamp", "")
                 try:
-                    ts = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone().isoformat(timespec="seconds")
+                    ts  = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone().isoformat(timespec="seconds")
                     day = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone().date().isoformat()
                 except Exception:
-                    ts = datetime.now().isoformat(timespec="seconds")
+                    ts  = datetime.now().isoformat(timespec="seconds")
                     day = datetime.now().date().isoformat()
                 messages.append({
-                    "ts": ts,
-                    "day": day,
+                    "ts": ts, "day": day,
                     "model": msg.get("model", ""),
-                    "input": inp,
-                    "output": out,
-                    "cache_read": cr,
-                    "cache_write": cw,
+                    "input": inp, "output": out,
+                    "cache_read": cr, "cache_write": cw,
                 })
     except Exception as e:
         debug(f"Chyba při čtení {path}: {e}")
@@ -128,7 +191,6 @@ def run_hook():
         debug("Žádné tokeny v transcript")
         return
 
-    # Součet celé session z transcript
     cur = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "turns": len(messages), "model": ""}
     for m in messages:
         cur["input"]       += m["input"]
@@ -141,8 +203,7 @@ def run_hook():
     if "session_totals" not in log:
         log["session_totals"] = {}
 
-    prev = log["session_totals"].get(session_id, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "turns": 0})
-
+    prev    = log["session_totals"].get(session_id, {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "turns": 0})
     d_inp   = cur["input"]       - prev["input"]
     d_out   = cur["output"]      - prev["output"]
     d_cr    = cur["cache_read"]  - prev["cache_read"]
@@ -183,16 +244,21 @@ def run_hook():
         "ts": datetime.now().isoformat(timespec="seconds"),
         "session_id": session_id,
         "model": model,
-        "input": d_inp,
-        "output": d_out,
-        "cache_read": d_cr,
-        "cache_write": d_cw,
+        "input": d_inp, "output": d_out,
+        "cache_read": d_cr, "cache_write": d_cw,
         "cost_usd": cost,
     })
     if len(log["sessions"]) > 500:
         log["sessions"] = log["sessions"][-500:]
 
     save_log(log)
+
+    # Celková cena aktuální session
+    session_total_cost = calc_cost(
+        model,
+        cur["input"], cur["output"], cur["cache_read"], cur["cache_write"]
+    )
+    check_alerts(log, session_id, session_total_cost)
     debug(f"OK: session={session_id} delta in={d_inp} out={d_out} cost=${cost:.6f}")
 
 
@@ -203,9 +269,9 @@ def rebuild():
     files = glob.glob(os.path.join(PROJ_DIR, "**", "*.jsonl"), recursive=True)
     print(f"Nalezeno {len(files)} JSONL souborů")
 
-    daily   = {}
-    total   = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0.0, "turns": 0}
-    sessions_log = []
+    daily = {}
+    total = {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0, "cost_usd": 0.0, "turns": 0}
+    sessions_log   = []
     session_totals = {}
 
     for fpath in sorted(files):
@@ -241,7 +307,6 @@ def rebuild():
             s_cr  += m["cache_read"]; s_cw += m["cache_write"]
 
         session_totals[session_id] = {"input": s_inp, "output": s_out, "cache_read": s_cr, "cache_write": s_cw, "turns": len(messages)}
-
         s_cost = calc_cost(model or "claude-sonnet-4-6", s_inp, s_out, s_cr, s_cw)
         sessions_log.append({
             "ts": messages[-1]["ts"],
@@ -254,13 +319,7 @@ def rebuild():
         print(f"  {session_id[:8]}…  {len(messages)} turns  ${s_cost:.4f}")
 
     sessions_log = sorted(sessions_log, key=lambda x: x["ts"])[-500:]
-
-    log = {
-        "sessions": sessions_log,
-        "daily": daily,
-        "total": total,
-        "session_totals": session_totals,
-    }
+    log = {"sessions": sessions_log, "daily": daily, "total": total, "session_totals": session_totals}
     save_log(log)
 
     print(f"\nHotovo.")
